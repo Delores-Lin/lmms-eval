@@ -38,8 +38,12 @@ def tokenize_latex(latex_code, latex_type="", middle_file=""):
             f.write(prepre)
     
         cmd = r"cat %s | node %s %s > %s " % (temp_file, os.path.join(os.path.dirname(__file__), 'preprocess_formula.js'), 'normalize', middle_file)
-        ret = subprocess.call(cmd, shell=True)
-        os.remove(temp_file)
+        try:
+            ret = subprocess.call(cmd, shell=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            ret = 1
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
         if ret != 0:
             return False, latex_code
         
@@ -74,8 +78,12 @@ def tokenize_latex(latex_code, latex_type="", middle_file=""):
             return False, latex_code
         os.remove(middle_file)
         cmd = r"cat %s | node %s %s > %s " % (temp_file, os.path.join(os.path.dirname(__file__), 'preprocess_tabular.js'), 'tokenize', middle_file)
-        ret = subprocess.call(cmd, shell=True)
-        os.remove(temp_file)
+        try:
+            ret = subprocess.call(cmd, shell=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            ret = 1
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
         if ret != 0:
             return False, latex_code
         with open(middle_file, 'r') as fin:

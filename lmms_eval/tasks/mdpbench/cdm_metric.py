@@ -1,6 +1,7 @@
 import os
 import json
 import shutil
+from functools import lru_cache
 import numpy as np
 from PIL import Image, ImageDraw
 from skimage.measure import ransac
@@ -25,8 +26,9 @@ class CDM:
         self.max_trials = 50
         
     @staticmethod
+    @lru_cache(maxsize=8)
     def gen_color_list(num=10, gap=15):
-        """Generate a list of distinct colors for visualization"""
+        """Generate a list of distinct colors for visualization (cached)."""
         num += 1
         single_num = 255 // gap + 1
         max_num = single_num ** 3

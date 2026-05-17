@@ -36,8 +36,10 @@ References:
 
 from __future__ import annotations
 
+import atexit
 import io
 import json
+import os
 import re
 import tempfile
 import unicodedata
@@ -54,22 +56,46 @@ from PIL import Image
 # CDM code is bundled in lmms_eval/tasks/mdpbench/cdm_metric.py
 # System requirements : pdflatex, Node.js with KaTeX installed
 
+# Module-level singletons to avoid re-creating expensive objects per sample.
+_TEDS_SCORER = None
+_CDM_EVALUATOR_INSTANCE = None
 
-def _get_cdm_evaluator(output_root="./cdm_result"):
-    """Lazily import CDM (bundled within this task).  Raises ImportError if system deps are missing."""
-    try:
-        from lmms_eval.tasks.mdpbench.cdm_metric import CDM
-    except ImportError as e:
-        raise ImportError(
-            "Failed to import CDM (required for MDPBench formula evaluation).\n"
-            "Make sure the following system dependencies are installed:\n"
-            "  - xelatex  (sudo apt-get install texlive-full)\n"
-            "  - ImageMagick 7  (magick command)\n"
-            "  - Node.js\n"
-            "  - scikit-image  (pip install scikit-image)\n"
-            f"Original error: {e}"
-        ) from e
-    return CDM(output_root=output_root)
+
+def _get_teds_scorer():
+    """Return a module-level TEDS singleton (avoids re-import + re-init per table)."""
+    global _TEDS_SCORER
+    if _TEDS_SCORER is None:
+        from lmms_eval.tasks.ocrbench_v2.TEDS_metric import TEDS
+        _TEDS_SCORER = TEDS(structure_only=False, n_jobs=1)
+    return _TEDS_SCORER
+
+
+def _get_cdm_evaluator(output_root=None):
+    """Return a module-level CDM singleton with a persistent per-process temp dir."""
+    global _CDM_EVALUATOR_INSTANCE
+    if _CDM_EVALUATOR_INSTANCE is None:
+        try:
+            from lmms_eval.tasks.mdpbench.cdm_metric import CDM
+        except ImportError as e:
+            raise ImportError(
+                "Failed to import CDM (required for MDPBench formula evaluation).\n"
+                "Make sure the following system dependencies are installed:\n"
+                "  - xelatex  (sudo apt-get install texlive-full)\n"
+                "  - ImageMagick 7  (magick command)\n"
+                "  - Node.js\n"
+                "  - scikit-image  (pip install scikit-image)\n"
+                f"Original error: {e}"
+            ) from e
+        # Use a fixed per-process directory so the singleton output_root never changes.
+        cdm_dir = output_root or os.path.join(
+            tempfile.gettempdir(), f"mdpbench_cdm_{os.getpid()}"
+        )
+        os.makedirs(cdm_dir, exist_ok=True)
+        _CDM_EVALUATOR_INSTANCE = CDM(output_root=cdm_dir)
+        # Clean up on exit
+        import shutil
+        atexit.register(shutil.rmtree, cdm_dir, True)
+    return _CDM_EVALUATOR_INSTANCE
 
 
 # ---------------------------------------------------------------------------
@@ -849,7 +875,9 @@ def _reclassify_formulas(
             gt_latex = item.get("gt", "")
             try:
                 from pylatexenc.latex2text import LatexNodes2Text
-                item["gt"] = LatexNodes2Text().latex_to_text(gt_latex)
+                if not hasattr(_reclassify_formulas, "_l2t"):
+                    _reclassify_formulas._l2t = LatexNodes2Text()
+                item["gt"] = _reclassify_formulas._l2t.latex_to_text(gt_latex)
             except Exception as exc:
                 eval_logger.warning(
                     f"latex2text failed for formula reclassification: {exc}"
@@ -898,53 +926,96 @@ def _compute_text_edit_from_matches(matches: List[Dict]) -> Dict[str, float]:
     return {"distance": total_dist / total_weight, "weight": total_weight}
 
 
+def _cdm_worker(args):
+    """Top-level worker for ProcessPoolExecutor (must be picklable)."""
+    import copy, tempfile, os
+    from lmms_eval.tasks.mdpbench.cdm_metric import CDM
+    gt_latex, pred_latex, formula_img_id, cdm_dir = args
+    cal_cdm = CDM(output_root=cdm_dir)
+    try:
+        result = cal_cdm.evaluate(
+            gt_latex=gt_latex,
+            pred_latex=pred_latex,
+            img_id=formula_img_id,
+        )
+        return float(result.get("F1_score", 0.0))
+    except Exception:
+        return 0.0
+
+
 def _compute_formula_cdm_from_matches(
     matches: List[Dict],
     img_id:  str,
 ) -> Dict[str, float]:
     """CDM F1 score for formula matches.  Unmatched GT formulas score 0.
 
+    The original MDPBench uses ProcessPoolExecutor(max_workers=32) globally
+    across all samples.  Here we parallelise within a single page when there
+    are multiple formulas (mirrors the spirit of the original).
+
     Returns {"score": float[0,1], "count": int}
     """
     if not matches:
         return {"score": 0.0, "count": 0}
 
-    total_f1   = 0.0
-    count      = 0
+    # Pre-process all formula pairs
+    jobs = []   # (gt_latex, pred_latex, formula_img_id) or None for skip
+    for i, item in enumerate(matches):
+        gt_latex = item.get("gt", "")
+        gt_latex = gt_latex.lstrip("$$").rstrip("$$").strip().lstrip("$").rstrip("$").strip()
+        pred_latex = item.get("pred", "")
+        pred_latex = pred_latex.split("```latex")[-1].split("```")[0]
+        pred_latex = pred_latex.lstrip("$$").rstrip("$$").strip().lstrip("$").rstrip("$").strip()
+        jobs.append((gt_latex, pred_latex, f"{img_id}_f{i}"))
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        evaluator = _get_cdm_evaluator(output_root=tmp_dir)
-        for i, item in enumerate(matches):
-            # Mirrors cal_metric._process_single_cdm_sample preprocessing
-            gt_latex = item.get("gt", "")
-            gt_latex = gt_latex.lstrip("$$").rstrip("$$").strip()
-            gt_latex = gt_latex.lstrip("$").rstrip("$").strip()
+    cdm_dir = _get_cdm_evaluator().output_root   # reuse singleton's output dir
+    scorable = [(gt, pred, fid) for gt, pred, fid in jobs if gt and pred]
+    skipped  = len(jobs) - len(scorable)          # empty gt or pred → score 0
 
-            pred_latex = item.get("pred", "")
-            pred_latex = pred_latex.split("```latex")[-1].split("```")[0]
-            pred_latex = pred_latex.lstrip("$$").rstrip("$$").strip()
-            pred_latex = pred_latex.lstrip("$").rstrip("$").strip()
+    if not scorable:
+        return {"score": 0.0, "count": len(jobs)}
 
-            if not gt_latex:
-                count += 1
-                continue
-            if not pred_latex:
-                count += 1       # unmatched → F1 = 0
-                continue
-            try:
-                result = evaluator.evaluate(
-                    gt_latex=gt_latex,
-                    pred_latex=pred_latex,
-                    img_id=f"{img_id}_f{i}",
-                )
-                total_f1 += float(result.get("F1_score", 0.0))
-                count    += 1
-            except Exception as exc:
-                eval_logger.warning(
-                    f"CDM failed for {img_id} formula {i}: {exc}"
-                )
-                count += 1  # count as 0, not skipped
+    # Parallelise when multiple formulas; fall back to serial for single formula
+    # to avoid ProcessPoolExecutor startup overhead.
+    f1_scores = []
+    if len(scorable) > 1:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        worker_args = [(gt, pred, fid, cdm_dir) for gt, pred, fid in scorable]
+        n_workers = min(len(scorable), 8)
+        try:
+            with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                futures = {executor.submit(_cdm_worker, a): idx
+                           for idx, a in enumerate(worker_args)}
+                results_map = {}
+                for future in as_completed(futures):
+                    idx = futures[future]
+                    try:
+                        results_map[idx] = future.result()
+                    except Exception as exc:
+                        eval_logger.warning(f"CDM worker failed for {img_id}: {exc}")
+                        results_map[idx] = 0.0
+            f1_scores = [results_map.get(i, 0.0) for i in range(len(scorable))]
+        except Exception as exc:
+            eval_logger.warning(f"ProcessPoolExecutor failed, falling back to serial: {exc}")
+            evaluator = _get_cdm_evaluator()
+            for gt, pred, fid in scorable:
+                try:
+                    r = evaluator.evaluate(gt_latex=gt, pred_latex=pred, img_id=fid)
+                    f1_scores.append(float(r.get("F1_score", 0.0)))
+                except Exception:
+                    f1_scores.append(0.0)
+    else:
+        gt, pred, fid = scorable[0]
+        evaluator = _get_cdm_evaluator()
+        try:
+            r = evaluator.evaluate(gt_latex=gt, pred_latex=pred, img_id=fid)
+            f1_scores.append(float(r.get("F1_score", 0.0)))
+        except Exception as exc:
+            eval_logger.warning(f"CDM failed for {img_id}: {exc}")
+            f1_scores.append(0.0)
 
+    total_f1 = sum(f1_scores)
+    count    = len(scorable) + skipped
     if count == 0:
         return {"score": 0.0, "count": 0}
     return {"score": total_f1 / count, "count": count}
@@ -955,8 +1026,8 @@ def _compute_teds(gt_html: str, pred_html: str) -> float:
     if not gt_html or not pred_html:
         return 0.0
     try:
-        from lmms_eval.tasks.ocrbench_v2.TEDS_metric import TEDS, wrap_html_table
-        scorer = TEDS(structure_only=False, n_jobs=1)
+        from lmms_eval.tasks.ocrbench_v2.TEDS_metric import wrap_html_table
+        scorer = _get_teds_scorer()
         return max(0.0, min(1.0,
             scorer.evaluate(
                 wrap_html_table(_normalize_html_table(pred_html)),
