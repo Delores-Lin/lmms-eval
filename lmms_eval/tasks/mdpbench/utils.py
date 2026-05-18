@@ -926,96 +926,39 @@ def _compute_text_edit_from_matches(matches: List[Dict]) -> Dict[str, float]:
     return {"distance": total_dist / total_weight, "weight": total_weight}
 
 
-def _cdm_worker(args):
-    """Top-level worker for ProcessPoolExecutor (must be picklable)."""
-    import copy, tempfile, os
-    from lmms_eval.tasks.mdpbench.cdm_metric import CDM
-    gt_latex, pred_latex, formula_img_id, cdm_dir = args
-    cal_cdm = CDM(output_root=cdm_dir)
-    try:
-        result = cal_cdm.evaluate(
-            gt_latex=gt_latex,
-            pred_latex=pred_latex,
-            img_id=formula_img_id,
-        )
-        return float(result.get("F1_score", 0.0))
-    except Exception:
-        return 0.0
-
-
 def _compute_formula_cdm_from_matches(
     matches: List[Dict],
     img_id:  str,
 ) -> Dict[str, float]:
     """CDM F1 score for formula matches.  Unmatched GT formulas score 0.
 
-    The original MDPBench uses ProcessPoolExecutor(max_workers=32) globally
-    across all samples.  Here we parallelise within a single page when there
-    are multiple formulas (mirrors the spirit of the original).
-
     Returns {"score": float[0,1], "count": int}
     """
     if not matches:
         return {"score": 0.0, "count": 0}
 
-    # Pre-process all formula pairs
-    jobs = []   # (gt_latex, pred_latex, formula_img_id) or None for skip
+    evaluator  = _get_cdm_evaluator()
+    total_f1   = 0.0
+    count      = 0
+
     for i, item in enumerate(matches):
         gt_latex = item.get("gt", "")
         gt_latex = gt_latex.lstrip("$$").rstrip("$$").strip().lstrip("$").rstrip("$").strip()
         pred_latex = item.get("pred", "")
         pred_latex = pred_latex.split("```latex")[-1].split("```")[0]
         pred_latex = pred_latex.lstrip("$$").rstrip("$$").strip().lstrip("$").rstrip("$").strip()
-        jobs.append((gt_latex, pred_latex, f"{img_id}_f{i}"))
 
-    cdm_dir = _get_cdm_evaluator().output_root   # reuse singleton's output dir
-    scorable = [(gt, pred, fid) for gt, pred, fid in jobs if gt and pred]
-    skipped  = len(jobs) - len(scorable)          # empty gt or pred → score 0
-
-    if not scorable:
-        return {"score": 0.0, "count": len(jobs)}
-
-    # Parallelise when multiple formulas; fall back to serial for single formula
-    # to avoid ProcessPoolExecutor startup overhead.
-    f1_scores = []
-    if len(scorable) > 1:
-        from concurrent.futures import ProcessPoolExecutor, as_completed
-        worker_args = [(gt, pred, fid, cdm_dir) for gt, pred, fid in scorable]
-        n_workers = min(len(scorable), 8)
+        if not gt_latex or not pred_latex:
+            count += 1
+            continue
         try:
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                futures = {executor.submit(_cdm_worker, a): idx
-                           for idx, a in enumerate(worker_args)}
-                results_map = {}
-                for future in as_completed(futures):
-                    idx = futures[future]
-                    try:
-                        results_map[idx] = future.result()
-                    except Exception as exc:
-                        eval_logger.warning(f"CDM worker failed for {img_id}: {exc}")
-                        results_map[idx] = 0.0
-            f1_scores = [results_map.get(i, 0.0) for i in range(len(scorable))]
-        except Exception as exc:
-            eval_logger.warning(f"ProcessPoolExecutor failed, falling back to serial: {exc}")
-            evaluator = _get_cdm_evaluator()
-            for gt, pred, fid in scorable:
-                try:
-                    r = evaluator.evaluate(gt_latex=gt, pred_latex=pred, img_id=fid)
-                    f1_scores.append(float(r.get("F1_score", 0.0)))
-                except Exception:
-                    f1_scores.append(0.0)
-    else:
-        gt, pred, fid = scorable[0]
-        evaluator = _get_cdm_evaluator()
-        try:
-            r = evaluator.evaluate(gt_latex=gt, pred_latex=pred, img_id=fid)
-            f1_scores.append(float(r.get("F1_score", 0.0)))
+            r = evaluator.evaluate(gt_latex=gt_latex, pred_latex=pred_latex, img_id=f"{img_id}_f{i}")
+            total_f1 += float(r.get("F1_score", 0.0))
+            count    += 1
         except Exception as exc:
             eval_logger.warning(f"CDM failed for {img_id}: {exc}")
-            f1_scores.append(0.0)
+            count += 1
 
-    total_f1 = sum(f1_scores)
-    count    = len(scorable) + skipped
     if count == 0:
         return {"score": 0.0, "count": 0}
     return {"score": total_f1 / count, "count": count}
