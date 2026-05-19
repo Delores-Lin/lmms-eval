@@ -73,7 +73,10 @@ def tokenize_latex(latex_code, latex_type="", middle_file=""):
         with open(middle_file, 'w') as f:
             f.write(latex_code.replace('\r', ' ').replace('\n', ' '))
         cmd = "perl -pe 's|hskip(.*?)(cm\\|in\\|pt\\|mm\\|em)|hspace{\\1\\2}|g' %s > %s"%(middle_file, temp_file)
-        ret = subprocess.call(cmd, shell=True)
+        try:
+            ret = subprocess.call(cmd, shell=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            ret = 1
         if ret != 0:
             return False, latex_code
         os.remove(middle_file)
