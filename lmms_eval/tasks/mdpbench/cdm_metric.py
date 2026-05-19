@@ -1,12 +1,15 @@
 import os
 import json
 import shutil
+import logging
 from functools import lru_cache
 import numpy as np
 from PIL import Image, ImageDraw
 from skimage.measure import ransac
 from lmms_eval.tasks.mdpbench.cdm.modules.latex2bbox_color import latex2bbox_color
 from lmms_eval.tasks.mdpbench.cdm.modules.visual_matcher import HungarianMatcher, SimpleAffineTransform
+
+eval_logger = logging.getLogger("lmms-eval")
 
 class CDM:
     def __init__(self, output_root="./result"):
@@ -212,7 +215,8 @@ class CDM:
             box_gt, box_pred = self._load_bboxes(img_id)
             img_gt, img_pred = self._load_images(img_id)
             matched_idxes, inliers = self._match_boxes(box_gt, box_pred, img_gt, img_pred)
-        except:
+        except Exception as e:
+            eval_logger.warning(f"CDM evaluation failed for img_id={img_id}: {type(e).__name__}: {e}")
             return {"recall": 0, "precision": 0, "F1_score": 0}
 
         recall, precision, F1_score = self._calculate_metrics(box_gt, box_pred, inliers)
