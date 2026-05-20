@@ -209,22 +209,45 @@ class CDM:
             dict: Evaluation metrics (recall, precision, F1_score)
         """
         
+        import time
         try:
             self._prepare_directories(img_id)
+            t0 = time.time()
             self._generate_bboxes(gt_latex, pred_latex, img_id)
+            t1 = time.time()
             box_gt, box_pred = self._load_bboxes(img_id)
+            t2 = time.time()
             img_gt, img_pred = self._load_images(img_id)
+            t3 = time.time()
             matched_idxes, inliers = self._match_boxes(box_gt, box_pred, img_gt, img_pred)
+            t4 = time.time()
+            if (t4 - t0) > 5:
+                eval_logger.warning(f"CDM slow [{img_id}]: generate={t1-t0:.1f}s load_bbox={t2-t1:.1f}s load_img={t3-t2:.1f}s match={t4-t3:.1f}s total={t4-t0:.1f}s")
         except Exception as e:
             eval_logger.warning(f"CDM evaluation failed for img_id={img_id}: {type(e).__name__}: {e}")
+            self._cleanup_files(img_id)
             return {"recall": 0, "precision": 0, "F1_score": 0}
 
         recall, precision, F1_score = self._calculate_metrics(box_gt, box_pred, inliers)
         self._visualize_matches(img_gt, img_pred, box_gt, box_pred, matched_idxes, inliers, img_id)
-        
+        self._cleanup_files(img_id)
+
         return {
             "recall": recall,
             "precision": precision,
             "F1_score": F1_score,
         }
+
+    def _cleanup_files(self, img_id):
+        """Remove per-sample intermediate files to prevent accumulation"""
+        for subset in ['gt', 'pred']:
+            for subdir in ['bbox', 'vis']:
+                for suffix in ['.jsonl', '_base.png', '.png']:
+                    path = os.path.join(self.output_root, subset, subdir, f"{img_id}{suffix}")
+                    if os.path.exists(path):
+                        os.remove(path)
+        for suffix in ['_base.png', '.png']:
+            path = os.path.join(self.output_root, 'vis_match', f"{img_id}{suffix}")
+            if os.path.exists(path):
+                os.remove(path)
 
